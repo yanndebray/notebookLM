@@ -1,0 +1,17 @@
+## Downloaded notebook data (can be large — mp4/m4a/pdf files)
+notebooks/
+
+## Persistent Chrome profile used for authentication
+## Contains session cookies — never commit this
+.chrome_scraper_profile/
+
+## Secrets and OS files
+.env
+.DS_Store
+
+## Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
