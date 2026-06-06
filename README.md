@@ -1,6 +1,6 @@
 # NotebookLM Scraper
 
-A Playwright-based scraper that exports all your [NotebookLM](https://notebooklm.google.com/) notebooks — including every generated Studio artifact (Audio Overviews, Slide Decks, Video Overviews, Mind Maps, etc.) — to a local folder.
+A Playwright-based scraper that exports all your [NotebookLM](https://notebooklm.google.com/) notebooks — including the full text of every source and every generated Studio artifact (Audio Overviews, Slide Decks, Video Overviews, Mind Maps, etc.) — to a local folder.
 
 ## What it collects
 
@@ -9,8 +9,8 @@ For each notebook, the scraper creates a folder and saves:
 | File | Description |
 |------|-------------|
 | `metadata.json` | Notebook title, ID, URL, source names, list of artifacts, scrape timestamp |
-| `sources.txt` | Names of all sources attached to the notebook (if detectable) |
 | `notebook_full.png` | Full-page screenshot of the notebook |
+| `sources/<name>.txt` | Full extracted text of each source document |
 | `*.m4a` | Audio Overview files (one per generated audio) |
 | `*.mp4` | Video Overview files |
 | `*.pdf` | Slide Decks, Reports, Infographics (where available) |
@@ -28,13 +28,16 @@ notebooks/
 │   ├── .notebook_id
 │   ├── metadata.json
 │   ├── notebook_full.png
-│   ├── sources.txt
+│   ├── sources/
+│   │   └── The massive gap in coding agent cost visibility.md.txt
 │   ├── Blueprint_Audio_Overview.m4a
 │   └── Blueprint_Slide_Deck.pdf
 ├── Academy_ The Video-to-Spec Pipeline for AI Coding agents/
 │   ├── .notebook_id
 │   ├── metadata.json
 │   ├── notebook_full.png
+│   ├── sources/
+│   │   └── video-to-spec-pipeline.md.txt
 │   ├── Pixels_to_Plans.pdf
 │   ├── Video_To_Structured_Specification.pdf
 │   └── Academy_Video_to_Code_Pipeline.png
@@ -97,9 +100,31 @@ For each notebook ID the script navigates directly to `https://notebooklm.google
 
 **Title extraction** tries several selectors in order: `h1`, `.notebook-title`, the page `<title>` element. The " — NotebookLM" suffix appended by the browser is stripped with a regex.
 
-**Source extraction** attempts multiple CSS selector strategies targeting the left-panel source list. NotebookLM's Angular components use obfuscated class names, so several fallback selectors are tried. This is the least reliable part of the scraper and may return an empty list for some notebooks.
+### 4. Source text extraction
 
-### 4. Studio artifact downloads
+Each source in the left panel is represented in the DOM as a `div.single-source-container`. The structure is:
+
+```
+div.single-source-container
+  button.source-stretched-button    ← click target to open the viewer
+  div.source-title-column
+    div.source-title                ← source name / file name
+    button[aria-label="More"]       ← ⋮ context menu
+```
+
+The scraper:
+
+1. Queries all `div.single-source-container` elements.
+2. Reads the source name from `div.source-title`.
+3. Clicks `button.source-stretched-button` to open the `<source-viewer>` panel.
+4. Scrolls within `source-viewer` to force the full content to load.
+5. Calls `innerText` on `source-viewer` and strips Angular/Material icon name strings (`button_magic`, `arrow_drop_up`, `description`, etc.) that appear as text nodes but are not document content.
+6. Saves the cleaned text to `sources/<source-name>.txt`.
+7. Presses Escape to close the viewer before moving to the next source.
+
+**Why `innerText` and not the network response?** NotebookLM processes uploaded files server-side and stores them in its own format. There is no direct download URL for the original source file from the viewer. The `innerText` of `source-viewer` is the rendered plain-text of whatever NotebookLM has processed — this works for PDFs, Markdown, Google Docs, and web pages alike.
+
+### 5. Studio artifact downloads
 
 This is the key insight: generated Studio artifacts (Audio Overviews, Slide Decks, Video Overviews, etc.) are listed **below the generation tiles** in the Studio panel. Each item has:
 
@@ -124,7 +149,7 @@ The scraper:
 
 Artifacts without a Download option (e.g., some Study Guides that are purely in-browser) are skipped gracefully.
 
-### 5. Incremental re-runs
+### 6. Incremental re-runs
 
 Each successfully scraped notebook writes a `.notebook_id` file containing just the UUID. On startup, `load_done_ids()` reads all `.notebook_id` files under `notebooks/` and skips those IDs. This means:
 
@@ -133,9 +158,10 @@ Each successfully scraped notebook writes a `.notebook_id` file containing just 
 
 ## Known limitations
 
-- **Sources panel**: The source names shown in the left panel use Angular component selectors that NotebookLM may change. Source extraction currently returns empty for many notebooks.
+- **Sources with large content**: The `source-viewer` panel loads content lazily. The scraper scrolls 5 times to trigger loading, but very long documents may still be truncated. The text is also plain — formatting, tables, and images from the original file are lost.
+- **Source viewer timeout**: Some sources (particularly large files or slow connections) may not load within the 8-second timeout. The scraper logs and skips these; re-running the script will retry them.
 - **Not-yet-generated artifacts**: Tiles at the top of the Studio panel (Audio Overview, Slide Deck, etc.) represent things that *can* be generated. The scraper only downloads artifacts that have already been generated and appear in the list below the tiles.
-- **Study Guide**: This artifact type appears in the list but has no Download button — the scraper logs and skips these.
+- **Study Guide**: This artifact type appears in the generated list but has no Download button — the scraper logs and skips it gracefully.
 - **macOS only**: The Chrome profile copy strategy and `channel="chrome"` launcher are macOS-specific. On Linux/Windows, adapt `CHROME_PROFILE_SRC` and potentially use `channel="chrome"` with the appropriate Chrome installation path.
 - **No API**: This scraper drives a real browser. NotebookLM has no public API, so the approach is inherently fragile to UI changes.
 
