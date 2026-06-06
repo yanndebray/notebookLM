@@ -2,13 +2,16 @@
 """
 NotebookLM scraper v3
 - Downloads studio artifacts via the ⋮ → Download menu (actual files)
-- Extracts source names from the left panel
+- Clicks every source to extract its full text via source-viewer
 - Skips notebooks whose .notebook_id file already exists
-- Uses persistent .chrome_scraper_profile so login only needed once
+- Uses a persistent Chrome profile so login is only needed once per account
 
-Usage:  python3 scrape_notebooklm.py
+Usage:
+  python3 scrape_notebooklm.py                        # default account
+  python3 scrape_notebooklm.py --output notebooks_work --profile .chrome_profile_work
 """
 
+import argparse
 import asyncio
 import json
 import re
@@ -17,10 +20,21 @@ import time
 from pathlib import Path
 from playwright.async_api import async_playwright, Download
 
-OUTPUT_DIR = Path(__file__).parent / "notebooks"
-SCRAPER_PROFILE = Path(__file__).parent / ".chrome_scraper_profile"
-CHROME_PROFILE_SRC = Path.home() / "Library/Application Support/Google/Chrome/Default"
 NOTEBOOKLM_URL = "https://notebooklm.google.com/"
+CHROME_PROFILE_SRC = Path.home() / "Library/Application Support/Google/Chrome/Default"
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Export all NotebookLM notebooks for one account.")
+    p.add_argument("--output", default="notebooks",
+                   help="Directory to save notebooks into (default: notebooks/)")
+    p.add_argument("--profile", default=".chrome_scraper_profile",
+                   help="Persistent Chrome profile dir for this account "
+                        "(default: .chrome_scraper_profile/)")
+    return p.parse_args()
+
+args = parse_args()
+OUTPUT_DIR     = Path(__file__).parent / args.output
+SCRAPER_PROFILE = Path(__file__).parent / args.profile
 
 
 # ---------------------------------------------------------------------------
@@ -37,9 +51,9 @@ def strip_suffix(title: str) -> str:
     return re.sub(r'\s*[-–|]\s*NotebookLM\s*$', '', title).strip()
 
 
-def load_done_ids() -> set[str]:
+def load_done_ids(output_dir: Path) -> set[str]:
     done = set()
-    for p in OUTPUT_DIR.glob("*/.notebook_id"):
+    for p in output_dir.glob("*/.notebook_id"):
         nb_id = p.read_text().strip()
         if nb_id:
             done.add(nb_id)
@@ -456,9 +470,10 @@ async def scrape_notebook(page, nb_id: str, output_root: Path) -> dict:
 
 async def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"Output: {OUTPUT_DIR}\n")
+    print(f"Output:  {OUTPUT_DIR}")
+    print(f"Profile: {SCRAPER_PROFILE}\n")
 
-    done_ids = load_done_ids()
+    done_ids = load_done_ids(OUTPUT_DIR)
     print(f"Already done: {len(done_ids)} notebooks (will skip)\n")
 
     profile = init_profile()
@@ -471,7 +486,6 @@ async def main():
             viewport={"width": 1440, "height": 900},
             args=["--disable-blink-features=AutomationControlled"],
             ignore_default_args=["--enable-automation"],
-            # Playwright will save downloads here by default; we move them manually
             accept_downloads=True,
         )
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
@@ -487,7 +501,6 @@ async def main():
         print(f"\n{len(remaining)} notebooks to scrape (skipping {len(done_ids)} done)\n")
 
         index = []
-        # Load existing index entries for already-done notebooks
         existing_index = OUTPUT_DIR / "index.json"
         if existing_index.exists():
             try:
@@ -500,7 +513,6 @@ async def main():
             try:
                 meta = await scrape_notebook(page, nb_id, OUTPUT_DIR)
                 index.append(meta)
-                # Save index after each notebook so progress is preserved
                 existing_index.write_text(
                     json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8"
                 )
