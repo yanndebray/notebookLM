@@ -139,63 +139,127 @@ async def collect_all_notebook_ids(page) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Sources
+# Sources — click each one and extract the full text from source-viewer
 # ---------------------------------------------------------------------------
 
-async def get_sources(page) -> list[str]:
-    sources = []
-    # Wait briefly for sources panel
+# Material Symbols icon names that appear as text in the DOM — not content
+_ICON_NAMES = {
+    "button_magic", "arrow_drop_up", "arrow_drop_down", "description",
+    "more_vert", "close", "check", "add", "search", "language",
+    "keyboard_arrow_down", "keyboard_arrow_up", "search_spark",
+    "dock_to_right", "chevron_forward", "open_in_new", "link",
+    "web", "file_copy", "source_guide", "audio_magic_eraser",
+}
+
+def clean_viewer_text(raw: str) -> str:
+    """Strip UI chrome (icon names, labels) from source-viewer innerText."""
+    lines = raw.split("\n")
+    cleaned = []
+    skip_labels = {"Source guide", "Close", "Source Guide"}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            cleaned.append("")
+            continue
+        # Skip Material icon names
+        if stripped.lower() in _ICON_NAMES:
+            continue
+        # Skip short UI labels
+        if stripped in skip_labels:
+            continue
+        cleaned.append(stripped)
+    # Remove leading/trailing blank lines
+    while cleaned and not cleaned[0]:
+        cleaned.pop(0)
+    while cleaned and not cleaned[-1]:
+        cleaned.pop()
+    return "\n".join(cleaned)
+
+
+async def scrape_sources(page, folder: Path) -> list[str]:
+    """
+    For each source in the left panel:
+      1. Read its title from div.source-title
+      2. Click button.source-stretched-button to open source-viewer
+      3. Scroll through the viewer to load all content
+      4. Extract and clean the text
+      5. Save to sources/<title>.txt
+    Returns list of source titles successfully scraped.
+    """
+    sources_dir = folder / "sources"
+    sources_dir.mkdir(exist_ok=True)
+
     await page.wait_for_timeout(1000)
+    containers = await page.query_selector_all("div.single-source-container")
+    print(f"  Sources: {len(containers)} found")
 
-    # Try progressively broader selectors
-    selector_groups = [
-        # Specific NotebookLM source chip selectors
-        [".source-chip .chip-label", "[class*='source-chip'] [class*='label']",
-         "source-chip [class*='label']"],
-        # Material list items in sources panel
-        [".sources-panel mat-list-item .mdc-list-item__primary-text",
-         "[class*='sources'] mat-list-item span"],
-        # Any list item text in the left panel area
-        ["[class*='SourceList'] [class*='title']",
-         "[class*='source-list'] [class*='label']"],
-    ]
-    for group in selector_groups:
-        for sel in group:
-            items = await page.query_selector_all(sel)
-            for item in items:
-                try:
-                    text = (await item.inner_text()).strip()
-                    if text and len(text) > 2 and text not in sources:
-                        sources.append(text)
-                except Exception:
-                    pass
-        if sources:
-            break
-
-    # Fallback: grab all source chip texts visible in left panel
-    if not sources:
+    scraped = []
+    for i, container in enumerate(containers):
+        title = f"source_{i}"
         try:
-            panel = await page.query_selector(
-                ".sources-panel, [class*='sources-panel'], "
-                "[class*='SourcesPanel'], [class*='left-panel']"
-            )
-            if panel:
-                # Look for any label-like spans that aren't buttons
-                items = await panel.query_selector_all(
-                    "span[class*='label'], span[class*='title'], "
-                    ".mdc-list-item__primary-text, .mat-list-text"
-                )
-                for item in items:
-                    try:
-                        text = (await item.inner_text()).strip()
-                        if text and len(text) > 2 and text not in sources:
-                            sources.append(text)
-                    except Exception:
-                        pass
+            title_el = await container.query_selector("div.source-title")
+            if title_el:
+                title = (await title_el.inner_text()).strip()
         except Exception:
             pass
 
-    return sources
+        safe_title = re.sub(r'[<>:"/\\|?*\n\r\t]', '_', title)[:120]
+        out_path = sources_dir / f"{safe_title}.txt"
+
+        # Skip if already saved
+        if out_path.exists():
+            print(f"  [source] skip (exists): {title[:60]}")
+            scraped.append(title)
+            continue
+
+        print(f"  [source] opening: {title[:60]}")
+        try:
+            btn = await container.query_selector("button.source-stretched-button")
+            if not btn:
+                print(f"  [source] no button for: {title[:60]}")
+                continue
+
+            await btn.click()
+            # Wait for source-viewer to appear and have content
+            try:
+                await page.wait_for_selector("source-viewer", timeout=8000)
+            except Exception:
+                print(f"  [source] viewer timeout: {title[:60]}")
+                await page.keyboard.press("Escape")
+                continue
+
+            await page.wait_for_timeout(1000)
+
+            # Scroll inside the viewer to load all content
+            viewer_el = await page.query_selector("source-viewer")
+            if viewer_el:
+                for _ in range(5):
+                    await viewer_el.evaluate("el => el.scrollTo(0, el.scrollHeight)")
+                    await page.wait_for_timeout(400)
+
+            # Extract full text
+            raw = await page.evaluate("""
+            () => {
+                const v = document.querySelector('source-viewer');
+                return v ? v.innerText : '';
+            }
+            """)
+            content = clean_viewer_text(raw)
+
+            if content:
+                out_path.write_text(content, encoding="utf-8")
+                print(f"  [source] saved: {safe_title}.txt ({len(content):,} chars)")
+                scraped.append(title)
+            else:
+                print(f"  [source] empty content: {title[:60]}")
+
+        except Exception as e:
+            print(f"  [source] error '{title[:40]}': {e}")
+        finally:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(600)
+
+    return scraped
 
 
 # ---------------------------------------------------------------------------
@@ -210,13 +274,23 @@ async def download_studio_artifacts(page, folder: Path) -> list[str]:
     Clicks the sibling button[aria-label='More'] → Download for each.
     """
     downloaded = []
+
+    # Check if artifacts were already downloaded in a previous run
+    existing = [f for f in folder.iterdir()
+                if f.suffix in {".m4a", ".mp4", ".pdf"} or
+                   (f.suffix == ".png" and f.name != "notebook_full.png")]
+    if existing:
+        print(f"  [studio] {len(existing)} artifact files already exist — skipping download")
+        return [f.stem for f in existing]
+
     await page.wait_for_timeout(1500)
 
     # Screenshot the full page for reference
-    try:
-        await page.screenshot(path=str(folder / "notebook_full.png"), full_page=True)
-    except Exception:
-        pass
+    if not (folder / "notebook_full.png").exists():
+        try:
+            await page.screenshot(path=str(folder / "notebook_full.png"), full_page=True)
+        except Exception:
+            pass
 
     # Scroll to reveal all artifact items
     for _ in range(3):
@@ -361,14 +435,9 @@ async def scrape_notebook(page, nb_id: str, output_root: Path) -> dict:
         "scraped_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
-    # Sources
-    sources = await get_sources(page)
+    # Sources — click each one and save the full text
+    sources = await scrape_sources(page, folder)
     meta["sources"] = sources
-    if sources:
-        (folder / "sources.txt").write_text("\n".join(sources), encoding="utf-8")
-        print(f"  Sources ({len(sources)}): {sources[:2]}{'...' if len(sources)>2 else ''}")
-    else:
-        print("  Sources: none detected")
 
     # Studio artifacts (download)
     downloaded = await download_studio_artifacts(page, folder)
