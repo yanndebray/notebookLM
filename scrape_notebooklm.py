@@ -30,6 +30,8 @@ def parse_args():
     p.add_argument("--profile", default=".chrome_scraper_profile",
                    help="Persistent Chrome profile dir for this account "
                         "(default: .chrome_scraper_profile/)")
+    p.add_argument("--retry-sources", action="store_true",
+                   help="Re-scrape source text for notebooks whose sources/ dir is empty")
     return p.parse_args()
 
 args = parse_args()
@@ -105,14 +107,16 @@ async def wait_for_login(page) -> bool:
         print("Session active — no login needed.")
         return True
     print("\nLogin required. Please sign in to your Google account in the browser window.")
-    print("Script will continue automatically.\n")
-    for i in range(120):
+    print("Waiting indefinitely — the script continues once you reach NotebookLM.\n")
+    i = 0
+    while True:
         await page.wait_for_timeout(5000)
         if "notebooklm.google.com" in page.url and "accounts.google.com" not in page.url:
             print(f"Logged in after {(i+1)*5}s.")
             return True
-    print("Timed out waiting for login.")
-    return False
+        i += 1
+        if i % 12 == 0:  # reminder every minute
+            print(f"  Still waiting for login... ({i*5}s elapsed)")
 
 
 # ---------------------------------------------------------------------------
@@ -468,13 +472,34 @@ async def scrape_notebook(page, nb_id: str, output_root: Path) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
+def load_index(output_dir: Path) -> dict:
+    """Load index.json, deduplicated by notebook_id (last entry wins)."""
+    path = output_dir / "index.json"
+    if not path.exists():
+        return {}
+    try:
+        entries = json.loads(path.read_text())
+        # Deduplicate: keep the last entry for each notebook_id
+        seen = {}
+        for entry in entries:
+            key = entry.get("notebook_id") or entry.get("title", "")
+            seen[key] = entry
+        return seen
+    except Exception:
+        return {}
+
+
+def save_index(output_dir: Path, index: dict):
+    path = output_dir / "index.json"
+    path.write_text(
+        json.dumps(list(index.values()), indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
 async def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Output:  {OUTPUT_DIR}")
     print(f"Profile: {SCRAPER_PROFILE}\n")
-
-    done_ids = load_done_ids(OUTPUT_DIR)
-    print(f"Already done: {len(done_ids)} notebooks (will skip)\n")
 
     profile = init_profile()
 
@@ -490,42 +515,53 @@ async def main():
         )
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
 
-        if not await wait_for_login(page):
+        await wait_for_login(page)
+        await page.wait_for_timeout(2000)
+
+        if args.retry_sources:
+            # Re-scrape source text only for notebooks with an empty sources/ dir
+            needs_sources = [
+                d for d in OUTPUT_DIR.iterdir()
+                if d.is_dir()
+                and not any(d.joinpath("sources").glob("*.txt"))
+                and (d / ".notebook_id").exists()
+            ]
+            print(f"--retry-sources: {len(needs_sources)} notebooks with missing source text\n")
+            index = load_index(OUTPUT_DIR)
+            for i, nb_dir in enumerate(sorted(needs_sources), 1):
+                nb_id = (nb_dir / ".notebook_id").read_text().strip()
+                print(f"\n[{i}/{len(needs_sources)}] {nb_dir.name}")
+                url = f"https://notebooklm.google.com/notebook/{nb_id}"
+                await page.goto(url, wait_until="load", timeout=60000)
+                await page.wait_for_timeout(3000)
+                sources = await scrape_sources(page, nb_dir)
+                if nb_id in index:
+                    index[nb_id]["sources"] = sources
+                save_index(OUTPUT_DIR, index)
+            print(f"\nDone. Results: {OUTPUT_DIR}")
             await ctx.close()
             return
 
-        await page.wait_for_timeout(2000)
         nb_ids = await collect_all_notebook_ids(page)
-
+        done_ids = load_done_ids(OUTPUT_DIR)
         remaining = [i for i in nb_ids if i not in done_ids]
-        print(f"\n{len(remaining)} notebooks to scrape (skipping {len(done_ids)} done)\n")
+        print(f"\n{len(remaining)} to scrape, {len(done_ids)} already done\n")
 
-        index = []
-        existing_index = OUTPUT_DIR / "index.json"
-        if existing_index.exists():
-            try:
-                index = json.loads(existing_index.read_text())
-            except Exception:
-                pass
-
+        index = load_index(OUTPUT_DIR)
         for i, nb_id in enumerate(remaining, 1):
             print(f"\n[{i}/{len(remaining)}] ID: {nb_id}")
             try:
                 meta = await scrape_notebook(page, nb_id, OUTPUT_DIR)
-                index.append(meta)
-                existing_index.write_text(
-                    json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8"
-                )
+                index[nb_id] = meta
+                save_index(OUTPUT_DIR, index)
             except Exception as e:
                 print(f"  ERROR: {e}")
-                index.append({"notebook_id": nb_id, "error": str(e)})
+                index[nb_id] = {"notebook_id": nb_id, "error": str(e)}
 
-        existing_index.write_text(
-            json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        save_index(OUTPUT_DIR, index)
         print(f"\n{'='*60}")
         print(f"Done! {len(remaining)} new notebooks scraped.")
-        print(f"Total index entries: {len(index)}")
+        print(f"Total: {len(index)} notebooks in index.")
         print(f"Results: {OUTPUT_DIR}")
         await ctx.close()
 
