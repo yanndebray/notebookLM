@@ -194,37 +194,61 @@ def clean_viewer_text(raw: str) -> str:
     return "\n".join(cleaned)
 
 
+async def _get_visible_source_titles(page) -> list[str]:
+    """Return titles of all div.single-source-container elements currently in the DOM."""
+    return await page.evaluate("""
+    () => [...document.querySelectorAll('div.single-source-container div.source-title')]
+          .map(el => el.innerText.trim()).filter(Boolean)
+    """)
+
+
 async def scrape_sources(page, folder: Path) -> list[str]:
     """
-    For each source in the left panel:
-      1. Read its title from div.source-title
-      2. Click button.source-stretched-button to open source-viewer
-      3. Scroll through the viewer to load all content
-      4. Extract and clean the text
-      5. Save to sources/<title>.txt
-    Returns list of source titles successfully scraped.
+    Scroll the sources panel to discover every source (handles virtual rendering),
+    then click each one to extract its full text from source-viewer.
+
+    The bug in the previous version: element handles fetched before the first
+    click become stale after the DOM updates on Escape, so all sources after
+    the first were silently skipped. Fix: re-query by title on every iteration
+    so we never hold a stale element reference across a DOM update.
     """
     sources_dir = folder / "sources"
     sources_dir.mkdir(exist_ok=True)
-
     await page.wait_for_timeout(1000)
-    containers = await page.query_selector_all("div.single-source-container")
-    print(f"  Sources: {len(containers)} found")
 
+    # --- Pass 1: scroll the sources panel to discover all source titles ---
+    all_titles: list[str] = []
+    seen: set[str] = set()
+    stale = 0
+
+    while stale < 3:
+        titles = await _get_visible_source_titles(page)
+        new = [t for t in titles if t not in seen]
+        for t in new:
+            seen.add(t)
+            all_titles.append(t)
+        if not new:
+            stale += 1
+        else:
+            stale = 0
+        # Scroll the sources panel down to reveal more items
+        await page.evaluate("""
+        () => {
+            const panel = document.querySelector(
+                '.source-panel, [class*="source-panel-content"], source-picker');
+            if (panel) panel.scrollTop += 250;
+        }
+        """)
+        await page.wait_for_timeout(400)
+
+    print(f"  Sources: {len(all_titles)} found")
+
+    # --- Pass 2: for each title, scroll it into view, click, extract ---
     scraped = []
-    for i, container in enumerate(containers):
-        title = f"source_{i}"
-        try:
-            title_el = await container.query_selector("div.source-title")
-            if title_el:
-                title = (await title_el.inner_text()).strip()
-        except Exception:
-            pass
-
+    for title in all_titles:
         safe_title = re.sub(r'[<>:"/\\|?*\n\r\t]', '_', title)[:120]
         out_path = sources_dir / f"{safe_title}.txt"
 
-        # Skip if already saved
         if out_path.exists():
             print(f"  [source] skip (exists): {title[:60]}")
             scraped.append(title)
@@ -232,38 +256,58 @@ async def scrape_sources(page, folder: Path) -> list[str]:
 
         print(f"  [source] opening: {title[:60]}")
         try:
-            btn = await container.query_selector("button.source-stretched-button")
+            # Scroll the title into view and re-query fresh handles each time
+            # (never reuse handles across Escape/DOM-update boundaries)
+            await page.evaluate(f"""
+            () => {{
+                for (const el of document.querySelectorAll('div.source-title')) {{
+                    if (el.innerText.trim() === {json.dumps(title)}) {{
+                        el.scrollIntoView({{block: 'center'}});
+                        break;
+                    }}
+                }}
+            }}
+            """)
+            await page.wait_for_timeout(300)
+
+            # Fresh query after scroll
+            btn = await page.evaluate_handle(f"""
+            () => {{
+                for (const c of document.querySelectorAll('div.single-source-container')) {{
+                    const t = c.querySelector('div.source-title');
+                    if (t && t.innerText.trim() === {json.dumps(title)}) {{
+                        return c.querySelector('button.source-stretched-button');
+                    }}
+                }}
+                return null;
+            }}
+            """)
             if not btn:
-                print(f"  [source] no button for: {title[:60]}")
+                print(f"  [source] button not found: {title[:60]}")
                 continue
 
             await btn.click()
-            # Wait for source-viewer to appear and have content
             try:
                 await page.wait_for_selector("source-viewer", timeout=8000)
             except Exception:
                 print(f"  [source] viewer timeout: {title[:60]}")
                 await page.keyboard.press("Escape")
+                await page.wait_for_timeout(400)
                 continue
 
             await page.wait_for_timeout(1000)
 
-            # Scroll inside the viewer to load all content
+            # Scroll viewer to load full content
             viewer_el = await page.query_selector("source-viewer")
             if viewer_el:
                 for _ in range(5):
                     await viewer_el.evaluate("el => el.scrollTo(0, el.scrollHeight)")
                     await page.wait_for_timeout(400)
 
-            # Extract full text
-            raw = await page.evaluate("""
-            () => {
-                const v = document.querySelector('source-viewer');
-                return v ? v.innerText : '';
-            }
-            """)
+            raw = await page.evaluate(
+                "() => { const v = document.querySelector('source-viewer'); return v ? v.innerText : ''; }"
+            )
             content = clean_viewer_text(raw)
-
             if content:
                 out_path.write_text(content, encoding="utf-8")
                 print(f"  [source] saved: {safe_title}.txt ({len(content):,} chars)")
