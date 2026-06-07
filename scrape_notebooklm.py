@@ -318,7 +318,17 @@ async def scrape_sources(page, folder: Path) -> list[str]:
         except Exception as e:
             print(f"  [source] error '{title[:40]}': {e}")
         finally:
-            await page.keyboard.press("Escape")
+            # Close the inline source view.
+            # The button has mattooltip="Close source view" (no aria-label)
+            # and uses the collapse_content icon.
+            try:
+                close_btn = await page.query_selector(
+                    'button[mattooltip="Close source view"]'
+                )
+                if close_btn:
+                    await close_btn.click()
+            except Exception:
+                pass
             await page.wait_for_timeout(600)
 
     return scraped
